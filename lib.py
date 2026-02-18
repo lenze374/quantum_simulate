@@ -1,8 +1,8 @@
 import numpy as np
 
 class Quantumket:
-
-    # 波矢容器, 功能：归一化(normalize)，计算模方(norm2)，取得布居数(population)，位置/动量空间转换(transform)。
+    # 这个基本功能居然就写了200行，感觉到通用付出的代价了233
+    # 波矢容器, 功能：归一化(normalize)，计算模方(norm2)，取得布居数(population)，位置/动量空间转换(transform)，x_origin（绝对位置原点）
     def __init__(
         self,
         state: np.ndarray,
@@ -17,12 +17,17 @@ class Quantumket:
         self.data = np.asarray(state, dtype=np.complex128)
         self.grid = None
         # external_types:
-        # - None: 不显式声明当前表象（transform 会尽量用缓存/网格推断）
+        # - None: 不允许（外部空间存在时必须显式声明 position/momentum）
         # - 'position' 或 'momentum': 显式声明当前表象
-        self.external_types = None if external_types is None else str(external_types).strip().lower()
-
-        # 历史信息（尽量轻量）：用于 external_types=None 时推断当前表象
-        self._last_external_types = self.external_types
+        if external_types is None:
+            self.external_types = None
+        else:
+            ext = str(external_types).strip().lower()
+            if ext == "x":
+                ext = "position"
+            elif ext in {"p", "k"}:
+                ext = "momentum"
+            self.external_types = ext
 
         # 绝对位置原点（不强行保存巨大的 x 绝对网格）
         # 约定：当在 position 表象下，实际坐标可理解为 x_abs = x_origin + x_centered
@@ -36,11 +41,15 @@ class Quantumket:
         else:
             self.internal_labels = tuple(f"s{i}" for i in range(self.data.shape[0]))
 
-        if self.data.ndim == 1 and Grid is not None:
-            raise ValueError("当state为一维数组时，Grid必须为None")
+        if self.data.ndim == 1:
+            if Grid is not None:
+                raise ValueError("当state为一维数组时，Grid必须为None")
+        else:
+            if Grid is None:
+                raise ValueError("当state具有外部空间维度(ndim>=2)时，必须提供 Grid")
 
         if self.external_types is not None and self.external_types not in {"position", "momentum"}:
-            raise ValueError("external_types 必须为 None/'position'/'momentum'")
+            raise ValueError("external_types 必须为 None/'position'/'momentum'，也允许别名：'x' 或 'p'/'k'")
 
         if Grid is not None:
             if self.external_types is None:
@@ -81,8 +90,6 @@ class Quantumket:
         
     def norm2(self) -> float:
         """总范数 ||psi||^2。
-
-        - 总是对内态与外态全部求和。
         - 若提供 grid（连续采样网格），则乘以体元 dV。
         """
         n2 = float(np.vdot(self.data, self.data).real)
@@ -122,7 +129,7 @@ class Quantumket:
         return float(pa)
 
     def transform(self):
-        """位置<->动量空间转换。
+        """位置<->动量空间转换（不修改当前对象，返回一个新的 Quantumket）。
         约定：
         - self.data.shape = (n_internal, *external_shape)
         - 只对外部轴做 FFT：axes = (1, 2, ..., data.ndim-1)
@@ -133,73 +140,106 @@ class Quantumket:
             raise ValueError("transform 需要外部空间维度：data.ndim 必须 >= 2")
 
         ext = self.external_types
+        if ext not in {"position", "momentum"}:
+            raise ValueError("当前Quantumket对象的external_types属性值无效，无法进行位置/动量空间转换")
         axes = tuple(range(1, self.data.ndim))
 
         if ext == "position":
             psi = np.fft.ifftshift(self.data, axes=axes)
             psi = np.fft.fftn(psi, axes=axes, norm="ortho")
-            self.data = np.fft.fftshift(psi, axes=axes)
-            self.external_types = "momentum"
-            self._last_external_types = "momentum"
+            new_data = np.fft.fftshift(psi, axes=axes)
+            new_external_types = "momentum"
             # 若有位置网格且为均匀网格，则生成对应的动量(k)网格
-            if self.grid is not None:
-                new_grid = []
-                for g in self.grid:
-                    N = g.shape[0]
-                    dx = float(g[1] - g[0])
-                    k = 2.0 * np.pi * np.fft.fftfreq(N, d=dx)
-                    k = np.fft.fftshift(k)
-                    new_grid.append(k.astype(float))
-                self.grid = tuple(new_grid)
-            return self
+            grids = []
+            for g in self.grid:
+                N = g.shape[0]
+                dx = float(g[1] - g[0])
+                k = 2.0 * np.pi * np.fft.fftfreq(N, d=dx)
+                k = np.fft.fftshift(k)
+                grids.append(k.astype(float))
+            new_grid = tuple(grids)
+
+            new_ket = Quantumket(
+                new_data,
+                internal_labels=self.internal_labels,
+                Grid=new_grid,
+                external_types=new_external_types,
+            )
+            new_ket.x_origin = float(self.x_origin)
+            return new_ket
 
         if ext == "momentum":
             psi = np.fft.ifftshift(self.data, axes=axes)
             psi = np.fft.ifftn(psi, axes=axes, norm="ortho")
-            self.data = np.fft.fftshift(psi, axes=axes)
-            self.external_types = "position"
-            self._last_external_types = "position"
+            new_data = np.fft.fftshift(psi, axes=axes)
+            new_external_types = "position"
             # 不保存巨大的“绝对 x 网格”；若有动量(k)网格则反推生成居中 x 网格
-            if self.grid is not None:
-                # 这里假设 self.grid 是均匀 k 网格（由 position->momentum 生成或用户提供）
-                new_grid = []
-                for g in self.grid:
-                    N = g.shape[0]
-                    dk = float(g[1] - g[0])
-                    if dk == 0.0:
-                        raise ValueError("动量网格步长 dk=0，无法反推位置网格")
-                    dx = 2.0 * np.pi / (N * abs(dk))
-                    # 只能生成“居中坐标系”的 x；绝对起点用 self.x_origin 另行记录
-                    x = (np.arange(N) - (N // 2)) * dx
-                    new_grid.append(x.astype(float))
-                self.grid = tuple(new_grid)
-            return self
+            # 这里假设 self.grid 是均匀 k 网格（由 position->momentum 生成或用户提供）
+            grids = []
+            for g in self.grid:
+                N = g.shape[0]
+                dk = float(g[1] - g[0])
+                dx = 2.0 * np.pi / (N * abs(dk))
+                # 只能生成“居中坐标系”的 x；绝对起点用 x_origin 另行记录
+                x = (np.arange(N) - (N // 2)) * dx
+                grids.append(x.astype(float))
+            new_grid = tuple(grids)
+
+            new_ket = Quantumket(
+                new_data,
+                internal_labels=self.internal_labels,
+                Grid=new_grid,
+                external_types=new_external_types,
+            )
+            new_ket.x_origin = float(self.x_origin)
+            return new_ket
 
         raise ValueError("当前Quantumket对象的external_types属性值无效，无法进行位置/动量空间转换")
 
     def __str__(self):
         return f"Quantumket(internal_labels={getattr(self, 'internal_labels', None)}, grid={getattr(self, 'grid', None)}) \n data={self.data}"
 
-
-
 class KineticOperator:
     # 动能算符，接口范例：
-    def apply(self, ket: Quantumket, mass: float):
-        if getattr(ket, 'external_types', None) != 'momentum':
+    def apply(self, ket: Quantumket, mass: float, hbar: float = 1.0):
+        """在动量(更准确：波矢 k)表象下作用动能算符。
+        约定：ket.grid 存的是每个外部轴的 k 坐标（由 transform(position->momentum) 生成）。
+        """
+        if str(getattr(ket, 'external_types', None)).strip().lower() != 'momentum':
             raise ValueError("KineticOperator仅适用于外部类型为'momentum'的Quantumket对象")
-        # 计算动能作用后的波矢
-        p_date = ket.data[1:]  # 假设动量数据从第二维开始
-        kinetic_data = p_date**2 / (2 * mass)
-        new_data = np.concatenate([ket.data[:1], kinetic_data], axis=0)
-        return Quantumket(new_data, internal_labels=getattr(ket, 'internal_labels', None), external_types=getattr(ket, 'external_types', None))
 
-    def expect(self, ket: Quantumket, mass: float):
-    
-        if getattr(ket, 'external_types', None) != 'momentum':
+        k2 = 0.0
+        nd = len(ket.grid)
+        for axis, k in enumerate(ket.grid):
+            shape = [1] * nd
+            shape[axis] = int(k.shape[0])
+            k_axis = np.asarray(k, dtype=float).reshape(shape)
+            k2 = k2 + k_axis * k_axis
+
+        T = (float(hbar) ** 2) * k2 / (2.0 * float(mass))
+        new_data = ket.data * T[np.newaxis, ...]
+        out = Quantumket(
+            new_data,
+            internal_labels=ket.internal_labels,
+            Grid=ket.grid,
+            external_types=ket.external_types,
+        )
+        out.x_origin = float(getattr(ket, 'x_origin', 0.0))
+        return out
+
+    def expect(self, ket: Quantumket, mass: float, hbar: float = 1.0):
+        if str(getattr(ket, 'external_types', None)).strip().lower() != 'momentum':
             raise ValueError("KineticOperator仅适用于外部类型为'momentum'的Quantumket对象")
-        # 计算动能期望
-        p_date = ket.data[1:]  # 假设动量数据从第二维开始
-        kinetic_data = p_date**2 / (2 * mass)
-        kinetic_energy = np.sum(kinetic_data * np.abs(ket.data[0])**2)  # 假设振幅数据在第一维
-        return kinetic_energy
+
+        k2 = 0.0
+        nd = len(ket.grid)
+        for axis, k in enumerate(ket.grid):
+            shape = [1] * nd
+            shape[axis] = int(k.shape[0])
+            k_axis = np.asarray(k, dtype=float).reshape(shape)
+            k2 = k2 + k_axis * k_axis
+
+        T = (float(hbar) ** 2) * k2 / (2.0 * float(mass))
+        exp_density = np.vdot(ket.data, ket.data * T[np.newaxis, ...]).real
+        return float(exp_density) * float(ket._dV())
 
