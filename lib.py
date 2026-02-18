@@ -17,8 +17,8 @@ class Quantumket:
         self.data = np.asarray(state, dtype=np.complex128)
         self.grid = None
         # external_types:
-        # - None: 不允许（外部空间存在时必须显式声明 position/momentum）
-        # - 'position' 或 'momentum': 显式声明当前表象
+        # - None: 如果纯内态（外部空间存在时必须显式声明 position/momentum）
+
         if external_types is None:
             self.external_types = None
         else:
