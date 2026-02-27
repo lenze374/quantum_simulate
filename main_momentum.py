@@ -1,5 +1,5 @@
 import numpy as np
-import lib
+import old_lib as lib
 
 
 # Dimensionless units: hbar = 1, kL = 1, Gamma = 1

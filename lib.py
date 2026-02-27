@@ -1,4 +1,5 @@
 import numpy as np
+import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -143,10 +144,20 @@ class Quantumket:
             raise ValueError("当前Quantumket对象的external_types属性值无效，无法进行位置/动量空间转换")
         axes = tuple(range(1, self.data.ndim))
 
+        # 采样语义下的自洽约定：
+        # - self.data 表示 ψ(grid) 的采样值
+        # - norm2()/population()/expect() 使用 ∑|ψ|^2 dV 近似连续内积
+        # - FFT(norm="ortho") 是对离散欧氏内积的酉变换
+        # 为保证 position<->momentum 变换前后 norm2 一致：
+        #   变换前乘 √dV_old，变换后除 √dV_new
+        dV_old = float(self._dV())
+        w_old = float(np.sqrt(dV_old))
+        
         if ext == "position":
-            psi = np.fft.ifftshift(self.data, axes=axes)
+            psi = np.asarray(self.data, dtype=np.complex128) * w_old
+            psi = np.fft.ifftshift(psi, axes=axes)
             psi = np.fft.fftn(psi, axes=axes, norm="ortho")
-            new_data = np.fft.fftshift(psi, axes=axes)
+            psi = np.fft.fftshift(psi, axes=axes)
             new_external_types = "momentum"
             # 若有位置网格且为均匀网格，则生成对应的动量(k)网格
             grids = []
@@ -158,6 +169,13 @@ class Quantumket:
                 grids.append(k.astype(float))
             new_grid = tuple(grids)
 
+            dV_new = 1.0
+            for g in new_grid:
+                dV_new *= float(abs(g[1] - g[0]))
+            w_new = float(np.sqrt(dV_new))
+
+            new_data = psi / w_new
+
             new_ket = Quantumket(
                 new_data,
                 internal_labels=self.internal_labels,
@@ -168,9 +186,10 @@ class Quantumket:
             return new_ket
 
         if ext == "momentum":
-            psi = np.fft.ifftshift(self.data, axes=axes)
+            psi = np.asarray(self.data, dtype=np.complex128) * w_old
+            psi = np.fft.ifftshift(psi, axes=axes)
             psi = np.fft.ifftn(psi, axes=axes, norm="ortho")
-            new_data = np.fft.fftshift(psi, axes=axes)
+            psi = np.fft.fftshift(psi, axes=axes)
             new_external_types = "position"
             grids = []
             for g in self.grid:
@@ -181,6 +200,13 @@ class Quantumket:
                 x = (np.arange(N) - (N // 2)) * dx
                 grids.append(x.astype(float))
             new_grid = tuple(grids)
+
+            dV_new = 1.0
+            for g in new_grid:
+                dV_new *= float(abs(g[1] - g[0]))
+            w_new = float(np.sqrt(dV_new))
+
+            new_data = psi / w_new
 
             new_ket = Quantumket(
                 new_data,
@@ -251,6 +277,26 @@ def CNstepper(ket: Quantumket, Operator, dt: float, tol: float = 1e-10, maxiter=
     约定：Operator.apply(psi) -> ndarray，与 psi 同 shape。
     - psi 是 numpy 数组（通常就是 ket.data）
     """
+    # Fast path: Operator provides precomputed CN matrices and a solver.
+    # Expected attributes (as in old_lib.make_cn_propagator):
+    # - Operator.B : sparse matrix
+    # - Operator.solve_A : callable(rhs_vec) -> sol_vec
+    # - Operator.cn_dt (optional): dt used for A/B
+    if hasattr(Operator, "prepare_cn"):
+        # Allow lazy caching inside Operator.
+        Operator.prepare_cn(float(dt))
+
+    solve_A = getattr(Operator, "solve_A", None)
+    B = getattr(Operator, "B", None)
+    op_dt = getattr(Operator, "cn_dt", None)
+
+    if solve_A is not None and B is not None and (op_dt is None or float(op_dt) == float(dt)):
+        vec = np.asarray(ket.data, dtype=np.complex128).reshape(-1)
+        rhs = B @ vec
+        sol = solve_A(np.asarray(rhs, dtype=np.complex128))
+        new_data = np.asarray(sol, dtype=np.complex128).reshape(ket.data.shape)
+        return Quantumket._fast_from(ket, new_data)
+
     shape = ket.data.shape
     n = int(ket.data.size)
 
@@ -274,6 +320,13 @@ def CNstepper(ket: Quantumket, Operator, dt: float, tol: float = 1e-10, maxiter=
 
     new_data = np.asarray(sol, dtype=np.complex128).reshape(shape)
     return Quantumket._fast_from(ket, new_data)
+
+
+
+
+
+
+
 
 def RKstepper(ket: Quantumket, Operator, dt: float):
     """经典 RK4 步进器。
@@ -402,7 +455,7 @@ def plot_dual_axis(x, y_left, y_right, left_label="left", right_label="right", t
     ax1.plot(x, y_left, color="C0")
     ax2.plot(x, y_right, color="C1")
 
-    ax1.set_xlabel("x")
+    ax1.set_xlabel("t")
     ax1.set_ylabel(str(left_label), color="C0")
     ax2.set_ylabel(str(right_label), color="C1")
     if title is not None:
