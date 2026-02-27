@@ -1,8 +1,12 @@
 import numpy as np
+import scipy.sparse.linalg as spla
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
 
 class Quantumket:
     # 这个基本功能居然就写了200行，感觉到通用付出的代价了233
-    # 波矢容器, 功能：归一化(normalize)，计算模方(norm2)，取得布居数(population)，位置/动量空间转换(transform)，x_origin（绝对位置原点）
+    # 波矢容器, 功能：归一化(normalize)，计算模方(norm2)，取得布居数(population)，取得位置动量期望（expect）,位置/动量空间转换(transform)，x_origin（绝对位置原点）
     def __init__(
         self,
         state: np.ndarray,
@@ -10,7 +14,7 @@ class Quantumket:
         Grid = None,
         external_types = None,
     ):
-        # state: 波矢数据，要求为numpy数组，且维度至少为1。内态波矢数据应放在第一维，外态波矢数据应放在第二维及之后的维度。
+        # state: 波矢数据，要求为numpy数组，且维度至少为1。
         # internal_labels: 内部标签，用于标识波矢的内部结构，如自旋态、能级等，要求为列表或数组，长度与state的第一维相同
         # Grid: 位置/动量网格，用于标识波矢在位置空间中的坐标或动量空间中的坐标，要求为1D数组（单轴）或由1D数组组成的tuple（多轴），每个数组长度必须与state对应的外部维度大小相同,
         # external_types: 外部类型，标识波矢的外部空间类型，如位置空间（Position）或动量空间（Momentum），默认位置空间
@@ -105,7 +109,7 @@ class Quantumket:
         self.data = self.data / np.sqrt(n2)
         return self
 
-    def population(self, index = None, label = None) -> float:
+    def population(self, label = None, index = None) -> float:
         # 获取布居数
         if index is not None and label is not None:
             raise ValueError("只能指定index或label中的一个，不能同时指定")
@@ -130,11 +134,6 @@ class Quantumket:
 
     def transform(self):
         """位置<->动量空间转换（不修改当前对象，返回一个新的 Quantumket）。
-        约定：
-        - self.data.shape = (n_internal, *external_shape)
-        - 只对外部轴做 FFT：axes = (1, 2, ..., data.ndim-1)
-        - 使用 norm='ortho' 保证往返互逆：ifft(fft(psi)) == psi（数值误差内）
-        - 使用 ifftshift/fftshift 成对，避免中心定义不一致导致额外相位/重排
         """
         if self.data.ndim < 2:
             raise ValueError("transform 需要外部空间维度：data.ndim 必须 >= 2")
@@ -173,8 +172,6 @@ class Quantumket:
             psi = np.fft.ifftn(psi, axes=axes, norm="ortho")
             new_data = np.fft.fftshift(psi, axes=axes)
             new_external_types = "position"
-            # 不保存巨大的“绝对 x 网格”；若有动量(k)网格则反推生成居中 x 网格
-            # 这里假设 self.grid 是均匀 k 网格（由 position->momentum 生成或用户提供）
             grids = []
             for g in self.grid:
                 N = g.shape[0]
@@ -196,50 +193,254 @@ class Quantumket:
 
         raise ValueError("当前Quantumket对象的external_types属性值无效，无法进行位置/动量空间转换")
 
+    def expect(self):
+        """外部坐标期望值 ⟨x⟩/⟨p⟩（取决于 external_types 与 grid 的含义）。
+
+        约定：
+        - self.data shape = (n_internal, N1, N2, ...)
+        - self.grid 是由外部每个轴的 1D 网格数组组成的 tuple，例如 (x,) 或 (kx, ky)
+
+        返回：
+        - 1D 外部空间：float
+        - 多维外部空间：tuple[float, ...]，每个轴一个期望值
+        """
+        if self.data.ndim < 2:
+            raise ValueError("expect 需要外部空间维度：data.ndim 必须 >= 2")
+        if self.grid is None:
+            raise ValueError("expect 需要 grid")
+
+        prob = np.sum(np.abs(self.data) ** 2, axis=0)
+        dV = float(self._dV())
+        norm = float(np.sum(prob) * dV)
+        if norm <= 0.0:
+            raise ValueError("态的范数为 0，无法计算期望值")
+
+        nd = prob.ndim
+        exps: list[float] = []
+        for axis, g in enumerate(self.grid):
+            if axis >= nd:
+                raise ValueError("grid 维数与波函数外部维数不匹配")
+            shape = [1] * nd
+            shape[axis] = int(np.asarray(g).shape[0])
+            coord = np.asarray(g, dtype=float).reshape(shape)
+            exps.append(float(np.sum(prob * coord) * dV / norm))
+
+        return exps[0] if len(exps) == 1 else tuple(exps)
+
     def __str__(self):
         return f"Quantumket(internal_labels={getattr(self, 'internal_labels', None)}, grid={getattr(self, 'grid', None)}) \n data={self.data}"
 
-class KineticOperator:
-    # 动能算符，接口范例：
-    def apply(self, ket: Quantumket, mass: float, hbar: float = 1.0):
-        """在动量(更准确：波矢 k)表象下作用动能算符。
-        约定：ket.grid 存的是每个外部轴的 k 坐标（由 transform(position->momentum) 生成）。
+    @staticmethod
+    def _fast_from(template: "Quantumket", data: np.ndarray) -> "Quantumket":
+        """快速构造一个与 template 共享 meta 的 Quantumket，只替换 data。
+
+        用途：给求解器/步进器返回新 ket 时，避免每一步都跑一次 __init__ 的输入检查。
+        注意：这是内部接口，不做 shape/grid 一致性校验。
         """
-        if str(getattr(ket, 'external_types', None)).strip().lower() != 'momentum':
-            raise ValueError("KineticOperator仅适用于外部类型为'momentum'的Quantumket对象")
+        k = Quantumket.__new__(Quantumket)
+        k.data = np.asarray(data, dtype=np.complex128)
+        k.grid = getattr(template, "grid", None)
+        k.external_types = getattr(template, "external_types", None)
+        k.x_origin = float(getattr(template, "x_origin", 0.0))
+        k.internal_labels = getattr(template, "internal_labels", None)
+        return k
 
+def CNstepper(ket: Quantumket, Operator, dt: float, tol: float = 1e-10, maxiter=None, restart=None):
+    """Crank–Nicolson 步进器。
+
+    约定：Operator.apply(psi) -> ndarray，与 psi 同 shape。
+    - psi 是 numpy 数组（通常就是 ket.data）
+    """
+    shape = ket.data.shape
+    n = int(ket.data.size)
+
+    alpha = 0.5j * dt
+    Hpsi = Operator.apply(ket.data)
+    rhs_vec = np.asarray(ket.data - alpha * Hpsi, dtype=np.complex128).reshape(n)
+    x0 = np.asarray(ket.data, dtype=np.complex128).reshape(n)
+
+    def matvec(v: np.ndarray) -> np.ndarray:
+        psi = np.asarray(v, dtype=np.complex128).reshape(shape)
+        Hv = Operator.apply(psi)
+        out = psi + alpha * np.asarray(Hv)
+        return np.asarray(out, dtype=np.complex128).reshape(n)
+
+    A = spla.LinearOperator((n, n), matvec=matvec, dtype=np.complex128)
+
+    sol, info = spla.gmres(A,rhs_vec, x0=x0, rtol=float(tol), atol=0.0, restart=restart, maxiter=maxiter)
+
+    if info != 0:
+        raise RuntimeError(f"GMRES 未收敛或失败 (info={info})；可尝试减小 dt、放宽 tol、增大 maxiter/restart")
+
+    new_data = np.asarray(sol, dtype=np.complex128).reshape(shape)
+    return Quantumket._fast_from(ket, new_data)
+
+def RKstepper(ket: Quantumket, Operator, dt: float):
+    """经典 RK4 步进器。
+
+    同 CNstepper 约定：Operator.apply(psi) -> ndarray。
+    """
+    dt = float(dt)
+
+    # 与 CN 同一物理约定：i dψ/dt = Hψ  =>  dψ/dt = -i Hψ
+    def f(data: np.ndarray):
+        return (-1j) * np.asarray(Operator.apply(data))
+
+    k1 = f(ket.data)
+    k2 = f(ket.data + 0.5 * dt * k1)
+    k3 = f(ket.data + 0.5 * dt * k2)
+    k4 = f(ket.data + dt * k3)
+
+    new_data = ket.data + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return Quantumket._fast_from(ket, new_data)
+
+
+class KineticOperator:
+    # 动能算符，接口范例，不适用长时间演化
+    def __init__(self, grid, *, mass: float = 1.0, hbar: float = 1.0):
+        # grid: tuple/list of 1D arrays, e.g. (k,) or (kx, ky)
+        if not isinstance(grid, (tuple, list)) or len(grid) == 0:
+            raise TypeError("grid 必须是由 1D 数组组成的 tuple/list")
+        grids = []
+        for g in grid:
+            arr = np.asarray(g, dtype=float)
+            if arr.ndim != 1:
+                raise ValueError("grid 的每个轴必须是一维数组")
+            grids.append(arr)
+        self.grid = tuple(grids)
+        self.mass = float(mass)
+        self.hbar = float(hbar)
+
+    def _dV(self) -> float:
+        if self.grid is None:
+            return 1.0
+        dV = 1.0
+        for g in self.grid:
+            dV *= float(abs(g[1] - g[0])) if g.shape[0] >= 2 else 1.0
+        return float(dV)
+
+    def apply(self, psi: np.ndarray) -> np.ndarray:
+        """在动量(更准确：波矢 k)表象下作用动能算符。"""
+        grid = self.grid
+        nd = len(grid)
         k2 = 0.0
-        nd = len(ket.grid)
-        for axis, k in enumerate(ket.grid):
+        for axis, k in enumerate(grid):
             shape = [1] * nd
-            shape[axis] = int(k.shape[0])
+            shape[axis] = int(np.asarray(k).shape[0])
             k_axis = np.asarray(k, dtype=float).reshape(shape)
             k2 = k2 + k_axis * k_axis
+        T = (float(self.hbar) ** 2) * k2 / (2.0 * float(self.mass))
 
-        T = (float(hbar) ** 2) * k2 / (2.0 * float(mass))
-        new_data = ket.data * T[np.newaxis, ...]
-        out = Quantumket(
-            new_data,
-            internal_labels=ket.internal_labels,
-            Grid=ket.grid,
-            external_types=ket.external_types,
-        )
-        out.x_origin = float(getattr(ket, 'x_origin', 0.0))
-        return out
+        psi_arr = np.asarray(psi, dtype=np.complex128)
+        return psi_arr * T[np.newaxis, ...]
 
-    def expect(self, ket: Quantumket, mass: float, hbar: float = 1.0):
-        if str(getattr(ket, 'external_types', None)).strip().lower() != 'momentum':
-            raise ValueError("KineticOperator仅适用于外部类型为'momentum'的Quantumket对象")
-
+    def expect(self, psi: np.ndarray) -> float:
+        """返回 <T>，使用离散网格体元近似（若有 grid）。"""
+        grid = self.grid
+        nd = len(grid)
         k2 = 0.0
-        nd = len(ket.grid)
-        for axis, k in enumerate(ket.grid):
+        for axis, k in enumerate(grid):
             shape = [1] * nd
-            shape[axis] = int(k.shape[0])
+            shape[axis] = int(np.asarray(k).shape[0])
             k_axis = np.asarray(k, dtype=float).reshape(shape)
             k2 = k2 + k_axis * k_axis
+        T = (float(self.hbar) ** 2) * k2 / (2.0 * float(self.mass))
 
-        T = (float(hbar) ** 2) * k2 / (2.0 * float(mass))
-        exp_density = np.vdot(ket.data, ket.data * T[np.newaxis, ...]).real
-        return float(exp_density) * float(ket._dV())
+        psi_arr = np.asarray(psi, dtype=np.complex128)
+        exp_density = np.vdot(psi_arr, psi_arr * T[np.newaxis, ...]).real
+        return float(exp_density) * float(self._dV())
 
+
+def plot_populations(t, pops, labels=None, ax=None, title=None, save_path=None, show=True):
+    """最基础的布居绘图：只画外部传入的 populations。
+
+    参数约定（尽量宽松）：
+    - t: 1D 时间轴
+    - pops: shape (n_series, T) 或 (T, n_series) 或 1D
+    """
+    t = np.asarray(t)
+    y = np.asarray(pops)
+    if y.ndim == 1:
+        y = y[np.newaxis, :]
+    if y.shape[0] == t.shape[0] and y.shape[-1] != t.shape[0]:
+        y = y.T
+
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.figure
+
+    n_series = int(y.shape[0])
+    if labels is None:
+        labels = [f"s{i}" for i in range(n_series)]
+
+    for i in range(n_series):
+        ax.plot(t, y[i], label=str(labels[i]) if i < len(labels) else f"s{i}")
+
+    ax.set_xlabel("t")
+    ax.set_ylabel("population")
+    if title is not None:
+        ax.set_title(str(title))
+    ax.legend()
+
+    if save_path is not None:
+        fig.savefig(str(save_path), dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def plot_dual_axis(x, y_left, y_right, left_label="left", right_label="right", title=None, save_path=None, show=True):
+    """双 y 轴基础绘图：完全不做任何物理计算，只画两条序列。"""
+    x = np.asarray(x)
+    y_left = np.asarray(y_left)
+    y_right = np.asarray(y_right)
+
+    fig, ax1 = plt.subplots()
+    ax2 = ax1.twinx()
+
+    ax1.plot(x, y_left, color="C0")
+    ax2.plot(x, y_right, color="C1")
+
+    ax1.set_xlabel("x")
+    ax1.set_ylabel(str(left_label), color="C0")
+    ax2.set_ylabel(str(right_label), color="C1")
+    if title is not None:
+        ax1.set_title(str(title))
+
+    if save_path is not None:
+        fig.savefig(str(save_path), dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig, (ax1, ax2)
+
+
+def animate_1d(x, y_t, interval_ms=50, title=None, ylabel=None):
+    """最基础 1D 动画：给定 x 与随时间变化的 y_t。
+
+    - x: shape (N,)
+    - y_t: shape (T, N) 或 (N, T)
+
+    返回 FuncAnimation；保存由外部调用 `ani.save(...)` 完成。
+    """
+    x = np.asarray(x)
+    y = np.asarray(y_t)
+    if y.ndim != 2:
+        raise ValueError("y_t 必须是 2D 数组")
+    if y.shape[0] == x.shape[0] and y.shape[1] != x.shape[0]:
+        y = y.T
+
+    fig, ax = plt.subplots()
+    (line,) = ax.plot(x, y[0])
+    ax.set_xlabel("x")
+    if ylabel is not None:
+        ax.set_ylabel(str(ylabel))
+    if title is not None:
+        ax.set_title(str(title))
+
+    def _update(i):
+        line.set_ydata(y[i])
+        return (line,)
+
+    ani = animation.FuncAnimation(fig, _update, frames=int(y.shape[0]), interval=float(interval_ms), blit=True)
+    return ani

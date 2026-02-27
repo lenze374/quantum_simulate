@@ -7,22 +7,20 @@
 ### 波函数
 
 psi.shape = (n_internal_states, n_external_states, ……)
+QuantumKet = (state, i_label, Grid , e_type)
 空间：内态 $\otimes$ 外态
 内态：$\ket{g}$, $\ket{e}$, 不同的F等
 外态：位置空间 $\ket{x}$, 动量空间 $\ket{p}$
-需要定义一个类实现
 
-### 算符
+### Operator/Hamitanian
 
-用不同函数，但统一接口，返回psi
+定义一个类，分开time-independent和time-dependent的部分，方便后续扩展，同时避免重复运算造成的性能开支。
+但运用的模型不同，很难统一，因此做好约定即可，根据实际情况设计。
 
 ### 求解器
 
-RK4 or CN
-
-### Hamitanian
-
-定义一个类，分开time-independent和time-dependent的部分，方便后续扩展，同时避免重复运算造成的性能开支。
+RKstepper(Quantumket, Operator, dt)
+CNstepper(Quantumket, Operator, dt)
 
 ### 绘图工具
 
