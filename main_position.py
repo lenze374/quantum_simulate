@@ -3,16 +3,16 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 # parameters, and It's needless to say hbar = 1 kL = 1
-delta = -2.0
+delta = -0.5
 Omega0 = 0.7
 Gamma = 1.0
 # time parameters
-N = 15000000
+N = 5000000
 dt = 0.0004
 t = np.linspace(0.0, N * dt, N + 1)
 # initial conditions
 M = 800.0
-v0 = 0.07
+v0 = 0.02
 
 
 n_max = int(M*v0) + 1000 # larger than M*v0

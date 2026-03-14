@@ -7,18 +7,18 @@ M = 800.0
 Gamma = 1.0
 kL = 1.0
 
-delta = -2.0  # red detuning
-Omega0 = 0.7   # beam Rabi amplitude (see lib._heff_apply_momentum)
+delta = -5.0  # red detuning
+Omega0 = 2.0   # beam Rabi amplitude (see lib._heff_apply_momentum)
 
 
 def main():
     # Simulation time grid
-    N = 20000
-    dt = 0.01
+    N = 200000
+    dt = 0.004
     t = np.linspace(0.0, N * dt, N + 1)
 
     # Initial (mean) velocity and momentum
-    v0 = 0.67
+    v0 = 0.07
     p0 = M * v0
 
     # Momentum grid: needs to be wide enough to contain recoil random walk.

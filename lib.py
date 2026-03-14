@@ -322,12 +322,6 @@ def CNstepper(ket: Quantumket, Operator, dt: float, tol: float = 1e-10, maxiter=
     return Quantumket._fast_from(ket, new_data)
 
 
-
-
-
-
-
-
 def RKstepper(ket: Quantumket, Operator, dt: float):
     """经典 RK4 步进器。
 
@@ -403,6 +397,31 @@ class KineticOperator:
         exp_density = np.vdot(psi_arr, psi_arr * T[np.newaxis, ...]).real
         return float(exp_density) * float(self._dV())
 
+def mcwf_step(ket: Quantumket, rng: np.random.Generator,JUMP_CHANNELS: tuple):
+    dp = 1.0 - ket.norm2()
+    if dp < 0.0:
+        dp = 0.0
+
+    if rng.random() >= dp:
+        return ket.normalize(), False
+
+    weights = np.zeros(len(JUMP_CHANNELS), dtype=float)
+    for i, (e_idx, _g_idx, branch) in enumerate(JUMP_CHANNELS):
+        weights[i] = branch * float(np.vdot(ket.data[e_idx], ket.data[e_idx]).real)
+    weights = weights / np.sum(weights)
+    channel_index = int(rng.choice(len(JUMP_CHANNELS), p=weights))
+
+    e_idx, g_idx, _ = JUMP_CHANNELS[channel_index]
+    source = ket.data[e_idx]
+    jumped = np.zeros_like(ket.data)
+
+    if rng.random() < 0.5:
+        jumped[g_idx, 1:] = source[:-1]
+    else:
+        jumped[g_idx, :-1] = source[1:]
+
+    ket = Quantumket._fast_from(ket, jumped).normalize()
+    return ket, True
 
 def plot_populations(t, pops, labels=None, ax=None, title=None, save_path=None, show=True):
     """最基础的布居绘图：只画外部传入的 populations。
